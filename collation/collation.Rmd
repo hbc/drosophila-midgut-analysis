@@ -1,0 +1,156 @@
+---
+title: integration of inDrop and 10x data
+description: This is the final upfront QC step before more complex integration
+category: research
+subcategory: rnaseq
+tags: [singlecell_rnaseq]
+Principal Investigator: Hubert Perrimon
+Researcher: Ruei-Jiun Hung
+Experiment: Drosophila gut single-cell RNA-seq
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: readable
+    df_print: paged
+    fig_width: 8.5
+    fig_height: 5
+---
+
+```{r set-publication-theme, echo=FALSE, cache=FALSE}
+ggplot2::theme_set(ggpubr::theme_pubr(base_size=10))
+```
+
+```{r setup, echo = FALSE, cache = FALSE}
+knitr::opts_chunk$set(dev = c('png', 'cairo_pdf'), 
+                      fig.align = 'center', fig.height = 5, fig.width = 8.5, 
+                      pdf.options(encoding = "ISOLatin9.enc"),
+                      fig.path='figures/')
+```
+
+# Overview
+This is a final massaging script-- we'll load the data, get it into one big
+dataframe, mark the metadata with which experiment it is from, which sample it
+is from, etc so we have all of the information we need in one place to do the
+downstream analysis.
+
+```{r load-libraries}
+library(tidyverse)
+library(viridis)
+library(Matrix)
+```
+
+# drop genes missing from inDrop data
+
+```{r load-data}
+indrop = readRDS(file.path("data", "indrop", "counts.rds"))
+tenx = readRDS(file.path("data", "10x", "counts.rds"))
+indrop_md = readRDS(file.path("data", "indrop", "metadata.rds"))
+tenx_md = readRDS(file.path("data", "10x", "metadata.rds"))
+md = readr::read_csv(file.path("..", "metadata", "sample_metadata.csv"))
+```
+
+We can see despite feeding in the same annotations, we end up with about 500
+more genes annotated in the 10x data than in the inDrop data. The reason for
+this is that rapmap when creating the index will dump transcripts that are
+identical to each other, and just retain one. CellRanger retains them all. Here
+we will subset down the 10x data to exclude the 500 genes which were removed
+from the inDrop data. This sounds like a lot, but there are only two genes which
+have non-zero counts in the 10x dataset, so we are really only excluding two
+genes. And the two genes which have counts only have two and one count total
+between them, so we are not missing anything by excluding these genes.
+
+```{r missing-stats}
+excluded = tenx[!rownames(tenx) %in% rownames(indrop),]
+excluded_stats = data.frame(gene=rownames(excluded),
+                            present=rowSums(excluded > 0) > 0)
+knitr::kable(excluded_stats %>%
+  group_by(present) %>%
+  summarise(count=n()))
+
+nonzero = excluded_stats %>%
+  dplyr::filter(present) %>%
+  pull(gene)
+
+knitr::kable(data.frame(total_counts=rowSums(excluded[nonzero,])))
+```
+
+```{r exclude-missing-10x}
+tenx = tenx[rownames(indrop),]
+```
+
+# add sample metadata
+Now we will expand the 10x metadata, to include information about which sample
+it was from, the technology that was used and the technical replicate. We'll do
+the same for the inDrop data. We're doing this separately because the cells are
+named differently.
+
+```{r expand-10x-metadata}
+tenx_md = tenx_md %>%
+  tidyr::separate(cell, into=c("drop1", "library", "drop2"), remove=FALSE) %>%
+  dplyr::select(-c("drop1", "drop2")) %>%
+  left_join(md, by="library") %>%
+  dplyr::select(-c("barcode", "rc_barcode", "passed_cellranger_filter"))
+```
+
+We do the same for the inDrop metadata, linking up the sample-level metadata with
+the barcodes identified in the data.
+
+```{r expand-indrop-metadata}
+indrop_md = indrop_md %>%
+  tidyr::separate(cell, into=c("drop1", "drop2"), sep=":", remove=FALSE) %>%
+  tidyr::separate(drop1, into=c("drop3", "rc_barcode"), sep="-") %>%
+  left_join(md, by="rc_barcode") %>%
+  dplyr::select(-c("barcode", "rc_barcode", "drop2", "drop3"))
+```
+
+# combine inDrop and 10x data
+Now we can combine the two datasets along with their metadata together into one
+big experiment, which we can use going forward. We make sure the metadata and the
+count data are in the same order and the output the counts and metadata tables for
+future use.
+
+```{r combine-indrop-10x-data}
+dat = cbind(tenx, indrop)
+md = rbind(tenx_md, indrop_md)
+rownames(md) = md$cell
+dat = dat[, rownames(md)]
+```
+
+We can see that most of the cells are contained in two samples, the **10x_2**
+and the **inDrop_2** sample. In particular they are driven by the **G4** library
+for the 10x and and the **gut4** library for the inDrop data.
+
+```{r cells-per-sample-and-library}
+knitr::kable(md %>%
+             group_by(sample) %>%
+             summarise(count=n()))
+knitr::kable(md %>%
+             group_by(library) %>%
+             summarise(count=n()))
+```
+
+Below is the **nUMI** vs **nGene** plot, colored by mitochondrial content, broken out by the
+four samples. This looks like what we expected, so I think we are good to go.
+
+```{r diagnostic-plots}
+ggplot(md, aes(nUMI, nGenes, color=pctMito)) +
+  facet_wrap(~sample) +
+  geom_point()  +
+  scale_x_log10(
+    breaks = scales::trans_breaks("log10", function(x) 10^x),
+    labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(
+    breaks = scales::trans_breaks("log10", function(x) 10^x),
+    labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  annotation_logticks(sides='bl') +
+  scale_color_viridis()
+```
+
+```{r save-combined-data}
+dir.create('combined')
+saveRDS(md, file.path("combined", "metadata.rds"))
+saveRDS(dat, file.path("combined", "counts.rds"))
+```
+

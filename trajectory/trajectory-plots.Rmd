@@ -1,0 +1,185 @@
+---
+title: trajectory analysis of ISC differentiation
+description: trajectory analysis of ISC differentiation
+category: research
+subcategory: rnaseq
+tags: [singlecell_rnaseq, trajectory]
+Principal Investigator: Hubert Perrimon
+Researcher: Ruei-Jiun Hung
+Experiment: Drosophila gut single-cell RNA-seq [hbc02022]
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: readable
+    df_print: paged
+    fig_width: 8.5
+    fig_height: 5
+---
+
+```{r set-publication-theme, echo=FALSE, cache=FALSE}
+ggplot2::theme_set(ggpubr::theme_pubr(base_size=10))
+```
+
+```{r setup, echo = FALSE, cache = FALSE}
+knitr::opts_chunk$set(dev = c('png', 'cairo_pdf'), 
+                      fig.align = 'center', fig.height = 5, fig.width = 8.5, 
+                      pdf.options(encoding = "ISOLatin9.enc"),
+                      fig.path='figures/', warning=FALSE, message=FALSE, cache=FALSE)
+```
+
+```{r load-libraries}
+library(mclust)
+library(Seurat)
+library(Matrix)
+library(tidyverse)
+library(viridis)
+library(broom)
+library(SingleCellExperiment)
+library(slingshot)
+set.seed(10)
+library(ggpubr)
+```
+
+```{r load-data}
+pcadat = readRDS(file.path("results", "trajectory-PCA.rds"))
+sce = readRDS(file.path("results", "trajectory-sce.rds"))
+sl1 = readRDS(file.path("results", "slingshot-trajectory.rds"))
+```
+
+```{r create-markerdata}
+toplot = c("Dl", "esg", "klu", "E(spl)m3-HLH", "E(spl)malpha-BFM", "E(spl)mbeta-HLH", "sna", "stg", "Piezo",
+           "mesh", "ssk", "pros", "betaTry", "lambdaTry", "lab")
+
+markerdat = logcounts(sce) %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene") %>%
+  gather("cell", "logcount", -gene) %>%
+  filter(gene %in% toplot)
+
+pseudotimes = data.frame(cell=colnames(sl1),
+                         pseudotime1=sl1$slingPseudotime_1,
+                         pseudotime2=sl1$slingPseudotime_2,
+                         pseudotime3=sl1$slingPseudotime_3,
+                         PC1=reducedDims(sl1)$PCA[, "PC1"],
+                         PC2=reducedDims(sl1)$PCA[, "PC2"],
+                         integrated_celltype=sl1$integrated_celltype
+                         )
+
+
+pcamarkers = data.frame(pseudotime1=sl1$slingPseudotime_1,
+                 pseudotime2=sl1$slingPseudotime_2,
+                 pseudotime3=sl1$slingPseudotime_3,
+                 PC1=reducedDims(sl1)$PCA[, "PC1"],
+                 PC2=reducedDims(sl1)$PCA[, "PC2"],
+                 cell=colnames(sl1)) %>%
+  left_join(markerdat, by="cell")
+```
+
+
+# improved trajectory plot
+```{r prettier-trajectory-plot-ggplot}
+sshot = SlingshotDataSet(sl1)
+
+plotdata = data.frame(
+  cell = rownames(sshot@clusterLabels),
+  curve1x=sshot@curves[["curve1"]]$s[, "PC1"],
+  curve1y=sshot@curves[["curve1"]]$s[, "PC2"],
+  celltype=sshot@clusterLabels
+) %>% left_join(pseudotimes, by="cell")
+
+curve1 = data.frame(sshot@curves[["curve1"]]$s[sshot@curves[["curve1"]]$ord,])
+curve2 = data.frame(sshot@curves[["curve2"]]$s[sshot@curves[["curve2"]]$ord,])
+curve3 = data.frame(sshot@curves[["curve3"]]$s[sshot@curves[["curve3"]]$ord,])
+
+p = ggplot(plotdata, aes(PC1, PC2, color=integrated_celltype)) +
+  geom_point(size=0.5, alpha=0.8) +
+  scale_color_viridis(discrete=TRUE)
+p = p + geom_path(data=curve1, col="black", lwd=1, linetype="solid")
+p = p + geom_path(data=curve2, col="black", lwd=1, linetype="solid")
+p = p + geom_path(data=curve3, col="black", lwd=1, linetype="solid")
+p
+
+```
+# pseudotime plots
+
+```{r pseudotime-plots}
+ggplot(pcamarkers, aes(PC1, PC2, color=pseudotime1)) +
+  geom_point(size=0.5, alpha=0.8) +
+  scale_color_viridis() +
+  geom_path(data=curve1, col="black", lwd=1, linetype="solid") +
+  ggtitle(paste0("lineage 1: ", paste0(sshot@lineages$Lineage1, collapse="->")))
+ggplot(pcamarkers, aes(PC1, PC2, color=pseudotime2)) +
+  geom_point(size=0.5, alpha=0.8) +
+  scale_color_viridis() +
+  geom_path(data=curve2, col="black", lwd=1, linetype="solid") +
+  ggtitle(paste0("lineage 2: ", paste0(sshot@lineages$Lineage2, collapse="->")))
+ggplot(pcamarkers, aes(PC1, PC2, color=pseudotime3)) +
+  geom_point(size=0.5, alpha=0.8) +
+  scale_color_viridis() +
+  geom_path(data=curve3, col="black", lwd=1, linetype="solid") +
+  ggtitle(paste0("lineage 3: ", paste0(sshot@lineages$Lineage3, collapse="->")))
+```
+
+```{r trajectory-with-clusternumbers}
+clusternumbers = pcamarkers %>%
+  left_join(colData(sce) %>%
+            as.data.frame())
+ggplot(clusternumbers, aes(PC1, PC2, color=integrated_snn_res.0.5)) +
+  geom_point(size=0.5, alpha=0.8) +
+  scale_color_viridis(discrete=TRUE) + 
+  geom_path(data=curve1, col="black", lwd=1, linetype="solid") +
+  geom_path(data=curve2, col="black", lwd=1, linetype="solid") +
+  geom_path(data=curve3, col="black", lwd=1, linetype="solid") +
+  labs(color="integrated cluster number") +
+  guides(color=guide_legend(override.aes = list(size = 2, alpha=1)))
+ggsave(file.path("figures", "trajectory-with-clusternumbers.pdf"))
+```
+
+
+# marker plots
+```{r marker-plots}
+pcamarkers = pcamarkers %>%
+  gather(c(pseudotime1, pseudotime2, pseudotime3), key="lineage", value="pseudotime")
+pcamarkers = pcamarkers %>%
+  mutate(lineagestring=ifelse(lineage == "pseudotime1", paste0(sshot@lineages$Lineage1, collapse="->"),
+                       ifelse(lineage == "pseudotime2", paste0(sshot@lineages$Lineage2, collapse="->"),
+                              paste0(sshot@lineages$Lineage3, collapse="->"))))
+ggplot(pcamarkers, aes(pseudotime, logcount, group=gene, color=gene)) +
+  geom_smooth(se=FALSE, lwd=0.5) +
+  facet_wrap(~lineagestring, ncol=1)
+
+ggplot(pcamarkers, aes(pseudotime, logcount, color=lineagestring)) +
+  geom_smooth(se=FALSE) +
+  facet_wrap(~gene, ncol=1, strip.position="left", scale='free_y') +
+  theme_pubr() +
+  theme(panel.margin=unit(0.5, "lines"),
+        strip.text.y = element_text(angle = 180),
+        axis.text.y=element_text(size=8)) +
+  scale_color_viridis(discrete=TRUE, begin=0) +
+  ylab("log count") +
+  labs(color="lineage") 
+ggsave(file.path("figures", "prettier-marker-plot.pdf"))
+```
+
+# Dl trajectory plot
+```{r dl-trajectory-plot}
+ggplot(pcamarkers %>%
+     filter(gene == "Dl"), aes(PC1, PC2, color=logcount)) +
+  geom_point(size=0.5, alpha=0.1) +
+  scale_color_viridis() + 
+  geom_path(data=curve1, col="black", lwd=1, linetype="solid") +
+  geom_path(data=curve2, col="black", lwd=1, linetype="solid") +
+  geom_path(data=curve3, col="black", lwd=1, linetype="solid") 
+ggsave(file.path("figures", "Dl-trajectory.pdf"))
+ggplot(pcamarkers %>%
+     filter(gene == "Dl") %>% filter(logcount > 0), aes(PC1, PC2, color=logcount)) +
+  geom_point(size=0.5, alpha=0.5) +
+  scale_color_viridis() + 
+  geom_path(data=curve1, col="black", lwd=1, linetype="solid") +
+  geom_path(data=curve2, col="black", lwd=1, linetype="solid") +
+  geom_path(data=curve3, col="black", lwd=1, linetype="solid") 
+ggsave(file.path("figures", "Dl-positive-only.pdf"))
+```

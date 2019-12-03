@@ -1,0 +1,448 @@
+---
+title: trajectory analysis of ISC differentiation
+description: trajectory analysis of ISC differentiation
+category: research
+subcategory: rnaseq
+tags: [singlecell_rnaseq, trajectory]
+Principal Investigator: Hubert Perrimon
+Researcher: Ruei-Jiun Hung
+Experiment: Drosophila gut single-cell RNA-seq [hbc02022]
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: readable
+    df_print: paged
+    fig_width: 8.5
+    fig_height: 5
+---
+
+```{r set-publication-theme, echo=FALSE, cache=FALSE}
+ggplot2::theme_set(ggpubr::theme_pubr(base_size=10))
+```
+
+```{r setup, echo = FALSE, cache = FALSE}
+knitr::opts_chunk$set(dev = c('png', 'cairo_pdf'), 
+                      fig.align = 'center', fig.height = 5, fig.width = 8.5, 
+                      pdf.options(encoding = "ISOLatin9.enc"),
+                      fig.path='figures/', warning=FALSE, message=FALSE, cache=FALSE)
+```
+
+```{r load-libraries}
+library(mclust)
+library(Seurat)
+library(Matrix)
+library(tidyverse)
+library(viridis)
+library(broom)
+library(SingleCellExperiment)
+library(slingshot)
+set.seed(10)
+```
+
+# Overview
+This report is using slingshot to do trajectory analysis of the ISC differentiation process. 
+
+![](figures/differentiation-image.png)
+
+Markers for genes:
+
+- ISC: Dl, Smvt, sna, polo, stf, cnn
+- EB: klu, E(spl)m3-HLH, E(spl)malpha-BFM, E(spl)mbeta-HLH
+- EC: Myo31DF, nub, any of Trypsin, such as alphaTry, betaTry....etc
+- EE: pros, AstA, AstC, Mip, NPF, CCHa1, CCHa2, Orcokinin, Tk, Dh31
+
+In the previous integration and clustering report we called all of these cell
+types by looking at sets of these markers and calling all cells clusterin with
+other cells expressing this markers as being of these cell types. This is too
+coarse-grained, however, and there will be cells that are, for example, labelled
+as EB cells that are in a transition point between EB cells and EE cells. We'd
+like to arrange the cells along this differentiation process which will fix the
+coarse clustering problem-- this is where pseudotime analysis comes in.
+are.
+
+The pseudotime analysis sounds magical, but it is pretty straightforward-- what
+we will do is find a small set of genes that we can use to call the different
+cell types. We have a set above and we found sets of genes from the clustering
+and we can whittle those down to a highly informative set. Then we'll do PCA and
+draw lines through where the cells are, starting at the ISC state and end at the
+EB and EE states, and we will measure the distance along that line to the two end
+states of EC and EE differentiation.
+
+# data wrangling
+
+```{r load-integrated-data}
+integrated = readRDS("../integration/results/integrated.rds")
+integrated_celltype = integrated@meta.data$integrated_celltype
+simple_celltype = case_when(
+  integrated_celltype %in% c("ISC/EB", "ISC") ~ "ISC/EB",
+  integrated_celltype %in% c("EE") ~ "EE",
+  integrated_celltype %in% c("aEC", "pEC", "mEC", "EC") ~ "EC",
+  integrated_celltype %in% c("2") ~ "2",
+  TRUE ~ "other")
+integrated@meta.data$simple_celltype = simple_celltype
+sce = as.SingleCellExperiment(integrated)
+```
+
+Here we load the integrated data from Seurat and make a
+**SummarizedSinglecellExperiment** object using the integrated data. This object
+can be used by slingshot. The `as.SingleCellExperiment` function does this, and uses the
+**data** slot from the 
+default assay in the Seurat object. For the integrated data object we loaded, the default
+assay is `r DefaultAssay(integrated)`. 
+
+## subset to ISC, EB, EC and EE cells
+Below we have the cell types we identified from the clustering along with their counts. We'll
+select cells in the **aEC, ISC, EE, ISC, ISC/EB and mEC** types.
+
+```{r subset-celltypes}
+as.data.frame.table(table(colData(sce)$integrated_celltype)) %>%
+  dplyr::rename(celltype=Var1, ncells=Freq) %>%
+  knitr::kable()
+keep_celltypes = c("aEC", "EE", "ISC", "ISC/EB","mEC", "pEC", "2")
+keep_cells = colData(sce) %>%
+  as.data.frame() %>%
+  dplyr::filter(integrated_celltype %in% keep_celltypes) %>%
+  pull(cell)
+sce = sce[, keep_cells]
+as.data.frame.table(table(colData(sce)$integrated_celltype)) %>%
+  dplyr::rename(celltype=Var1, ncells=Freq) %>%
+  knitr::kable()
+```
+
+## reduce data
+We'll drop genes unlikely to be informative, so here we require it to be expressed in 5 cells and 
+have at least 10 total counts.
+
+```{r }
+#ad = GetAssayData(integrated, assay="SCT", slot="counts")
+#keep_genes = rownames(ad)[Matrix::colSums(ad > 5) & Matrix::colSums(ad) > 10]
+```
+
+### provided + derived markers
+```{r load-state-markers}
+markerfiles = list.files(path=file.path("..", "integration", "results", "markers_roc"),
+                   pattern="*.csv", full.names=TRUE)
+read_files = function(files) {
+  data_frame(filename = files) %>%
+    mutate(contents = map(filename, ~ read_csv(.))) %>%
+    unnest()
+}
+remap = data.frame(filestring=paste0("cluster", seq(0, 22)),
+                   cluster=paste0("cluster", seq(0, 22)))
+markers = read_files(markerfiles) %>%
+  mutate(cluster=str_extract(filename, "cluster\\d+"))
+```
+
+
+```{r keep-informative-genes}
+keep_clusters = paste0("cluster", unique(colData(sce)$seurat_clusters))
+keep_markers = markers %>%
+  dplyr::filter(cluster %in% keep_clusters) %>%
+  group_by(cluster) %>%
+  top_n(50, power) %>%
+  pull(gene)
+isc = data.frame(gene=c("Dl", "Smvt", "sna", "polo", "stf", "cnn"),
+                 celltype="ISC")
+eb = data.frame(gene=c("klu", "E(spl)m3-HLH", "E(spl)malpha-BFM", "E(spl)mbeta-HLH"),
+                celltype="EB")
+ec = data.frame(gene=c("Myo31DF", "nub", "alphaTry", "betaTry"),
+                celltype="EC")
+ee = data.frame(gene=c("pros", "AstaA", "AstaC", "Mip", "NPF", "CCHa1", "CCHa2", "Orcokinin", "Tk", "Dh31"),
+                celltype = "EE")
+provided = rbind(isc, eb, ec, ee)
+keep_markers = unique(keep_markers, provided$gene)
+```
+
+Here we created lists of genes that act as markers for the different cell types.
+We did this by loading the top 50 markers for each cluster sorting by power from
+the marker finding we did on the integrated data. We also included, if they did
+not exist already, the marker genes listed above. This leaves us with `r length(keep_markers)`
+genes to work with.
+
+```{r principal-components}
+pca1 = prcomp(t(assays(sce)$logcounts[keep_markers,]), scale=FALSE)
+pcadat = pca1$x %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  left_join(colData(sce) %>% as.data.frame(), by="cell")
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+```
+
+We can see that these don't show an ordering like we were expecting. This looks more like three branches,
+one of the ISC/EB cells going into a north and south branches to EE cells and a westerly branch of EC cells.
+What if we use just the provided genes?
+
+### provided markers
+
+```{r just-provided}
+provided_genes = provided$gene[provided$gene %in% rownames(assays(sce)$logcounts)]
+pca1 = prcomp(t(assays(sce)$logcounts[provided_genes,]), scale=FALSE)
+pcadat = pca1$x %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  left_join(colData(sce) %>% as.data.frame(), by="cell")
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+```
+
+Just the provided genes doesn't look particulary impressive either, but at least it makes a little more
+sense.
+
+### no filtering
+
+```{r no-filtering}
+pca1 = prcomp(t(assays(sce)$logcounts), scale=FALSE)
+pcadat = pca1$x %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  left_join(colData(sce) %>% as.data.frame(), by="cell")
+pcadat$pros = assays(sce)$logcounts["pros",]
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE) 
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+```
+
+```{r identity-check}
+tryp = c("deltaTry", "gammaTry", "alphaTry", "betaTry",
+         "epsilonTry", "thetaTry", "kappaTry", "lambdaTry",
+         "iotaTry", "etaTry", "zetaTry")
+pcadat$tryp = Matrix::colMeans(assays(sce)$logcounts[tryp,])
+pcadat$ee = Matrix::colMeans(assays(sce)$logcounts[ee$gene[ee$gene %in% rownames(assays(sce)$logcounts)],])
+pcadat$Dl = assays(sce)$logcounts["Dl",]
+pcadat$alphaTry = assays(sce)$logcounts["alphaTry",]
+pcadat$betaTry = assays(sce)$logcounts["betaTry",]
+pcadat$betaTry = assays(sce)$logcounts["betaTry",]
+ggplot(pcadat, aes(PC1, PC2, color=Dl)) + geom_point() +
+  facet_wrap(~integrated_celltype) +
+  scale_color_viridis()
+ggplot(pcadat, aes(PC1, PC2, color=alphaTry)) + geom_point() +
+  facet_wrap(~integrated_celltype) +
+  scale_color_viridis()
+ggplot(pcadat, aes(PC1, PC2, color=alphaTry)) + geom_point() +
+  facet_wrap(~seurat_clusters) +
+  scale_color_viridis()
+ggplot(pcadat, aes(PC1, PC2, color=tryp)) + geom_point() +
+  facet_wrap(~integrated_celltype) +
+  scale_color_viridis()
+ggplot(pcadat, aes(PC1, PC2, color=ee)) + geom_point() +
+  facet_wrap(~integrated_celltype) +
+  scale_color_viridis()
+ggplot(pcadat %>%
+       dplyr::filter(integrated_celltype == "EE"),
+       aes(PC1, PC2, color=ee)) +
+  geom_point() +
+  facet_wrap(~seurat_clusters)
+
+```
+
+# Trajectory analysis
+Here we look at doing the trajectory analysis on the unfiltered data. We can see
+here that the trajectory doesn't look like the figure, there are two branches
+starting from the ISC/EB cells, one heading to become EC cells and one heading
+to become EE cells, but the intermediate state here are cells we are calling pEC
+cells, not EB cells. Those pEC cells are clusters 5 and 11, which we originally
+were calling ISC/EB cells. 
+
+## No filtering, no PCA scaling
+```{r no-filtering-trajectory}
+ncomponents = 2
+pca1 = prcomp(t(assays(sce)$logcounts), scale=FALSE)
+pcadat = pca1$x %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  left_join(colData(sce) %>% as.data.frame(), by="cell")
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE) 
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+reducedDims(sce) = SimpleList(PCA=pca1$x[, 1:ncomponents])
+cl1 = Mclust(pca1$x[, 1:50], verbose=FALSE)
+colData(sce)$GMM = as.factor(cl1$classification)
+pcadat$GMM = as.factor(cl1$classification)
+ggplot(pcadat, aes(PC1, PC2, color=GMM)) +
+  geom_point() 
+  facet_wrap(~simple_celltype)
+sl1 = slingshot(sce, clusterLabels="integrated_celltype", reducedDim="PCA", start.clus="ISC/EB",
+                end.clus="EE")
+
+library(RColorBrewer)
+pal = brewer.pal(9, 'Set1')
+pointcolors = pal[as.factor(sce$simple_celltype)]
+plot(reducedDims(sce)$PCA, col = pointcolors, pch=16, asp = 1, cex=0.5)
+lines(SlingshotDataSet(sl1), lwd=2, type = 'lineages', col = 'black')
+legendlabels = unique(as.factor(sce$simple_celltype))
+legendcolors = unique(pointcolors)
+legend("topleft", pch=16, legend=legendlabels, col=legendcolors)
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+```
+
+## No filtering, with PCA scaling
+```{r no-filtering-no-scaling}
+variance_genes = apply(assays(sce)$logcounts, 1, var) != 0
+pca1 = prcomp(t(assays(sce)$logcounts[variance_genes,]), scale=TRUE)
+pcadat = pca1$x %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  left_join(colData(sce) %>% as.data.frame(), by="cell")
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE) 
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+reducedDims(sce) = SimpleList(PCA=pca1$x[, 1:ncomponents])
+cl1 = Mclust(pca1$x[, 1:50], verbose=FALSE)
+colData(sce)$GMM = as.factor(cl1$classification)
+pcadat$GMM = as.factor(cl1$classification)
+ggplot(pcadat, aes(PC1, PC2, color=GMM)) +
+  geom_point() 
+  facet_wrap(~simple_celltype)
+sl1 = slingshot(sce, clusterLabels="integrated_celltype", reducedDim="PCA", start.clus="ISC/EB",
+                end.clus="EE")
+
+library(RColorBrewer)
+pal = brewer.pal(9, 'Set1')
+pointcolors = pal[as.factor(sce$simple_celltype)]
+plot(reducedDims(sce)$PCA, col = pointcolors, pch=16, asp = 1, cex=0.5)
+lines(SlingshotDataSet(sl1), lwd=2, type = 'lineages', col = 'black')
+legendlabels = unique(as.factor(sce$simple_celltype))
+legendcolors = unique(pointcolors)
+legend("topleft", pch=16, legend=legendlabels, col=legendcolors)
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+```
+
+
+## filtered trajectory, no PCA scaling
+```{r filtered-trajectory}
+pca1 = prcomp(t(assays(sce)$logcounts[keep_markers,]), scale=FALSE)
+pcadat = pca1$x %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  left_join(colData(sce) %>% as.data.frame(), by="cell")
+reducedDims(sce) = SimpleList(PCA=pca1$x[, 1:ncomponents])
+cl1 = Mclust(pca1$x[, 1:ncomponents], verbose=FALSE)
+colData(sce)$GMM = as.factor(cl1$classification)
+pcadat$GMM = as.factor(cl1$classification)
+ggplot(pcadat, aes(PC1, PC2, color=GMM)) +
+  geom_point() 
+facet_wrap(~simple_celltype)
+sl1 = slingshot(sce, clusterLabels="integrated_celltype", reducedDim="PCA",
+                start.clus="ISC/EB", end.clus="EE")
+library(RColorBrewer)
+pal = brewer.pal(9, 'Set1')
+pointcolors = pal[as.factor(sce$simple_celltype)]
+plot(reducedDims(sce)$PCA, col = pointcolors, pch=16, asp = 1, cex=0.5)
+lines(SlingshotDataSet(sl1), lwd=2, type = 'lineages', col = 'black')
+legendlabels = unique(as.factor(sce$simple_celltype))
+legendcolors = unique(pointcolors)
+legend("topleft", pch=16, legend=legendlabels, col=legendcolors)
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+```
+
+## filtered trajectory, with PCA scaling
+```{r filtered-trajectory-with-scaling}
+pca1 = prcomp(t(assays(sce)$logcounts[keep_markers,]), scale=TRUE)
+pcadat = pca1$x %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  left_join(colData(sce) %>% as.data.frame(), by="cell")
+reducedDims(sce) = SimpleList(PCA=pca1$x[, 1:ncomponents])
+cl1 = Mclust(pca1$x[, 1:ncomponents], verbose=FALSE)
+colData(sce)$GMM = as.factor(cl1$classification)
+pcadat$GMM = as.factor(cl1$classification)
+ggplot(pcadat, aes(PC1, PC2, color=GMM)) +
+  geom_point() 
+ggplot(pcadat, aes(PC1, PC2, color=GMM)) +
+  geom_point() +
+  facet_wrap(~simple_celltype)
+sl1 = slingshot(sce, clusterLabels="integrated_celltype", reducedDim="PCA", start.clus="ISC/EB",
+                end.clus="EE")
+library(RColorBrewer)
+pal = brewer.pal(9, 'Set1')
+pointcolors = pal[as.factor(sce$simple_celltype)]
+plot(reducedDims(sce)$PCA, col = pointcolors, pch=16, asp = 1, cex=0.5)
+lines(SlingshotDataSet(sl1), lwd=2, type = 'lineages', col = 'black')
+legendlabels = unique(as.factor(sce$simple_celltype))
+legendcolors = unique(pointcolors)
+legend("topleft", pch=16, legend=legendlabels, col=legendcolors)
+
+ggplot(pcadat, aes(PC1, PC2, color=simple_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+ggplot(pcadat, aes(PC1, PC2, color=integrated_celltype)) + geom_point() +
+  scale_color_viridis(discrete=TRUE)
+saveRDS(pcadat, file.path("results", "trajectory-PCA.rds"))
+saveRDS(sce, file.path("results", "trajectory-sce.rds"))
+saveRDS(sl1, file.path("results", "slingshot-trajectory.rds"))
+```
+
+# pseudotime plots
+```{r pseudotime-plots}
+toplot = c("Dl", "esg", "klu", "E(spl)m3-HLH", "E(spl)malpha-BFM", "E(spl)mbeta-HLH", "sna", "stg", "Piezo",
+           "mesh", "ssk", "pros", "betaTry", "lambdaTry", "lab")
+
+markerdat = logcounts(sce) %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene") %>%
+  gather("cell", "logcount", -gene) %>%
+  filter(gene %in% toplot) 
+
+
+foo = data.frame(pseudotime1=sl1$slingPseudotime_1,
+                 pseudotime2=sl1$slingPseudotime_2,
+                 pseudotime3=sl1$slingPseudotime_3,
+                 PC1=reducedDims(sl1)$PCA[, "PC1"],
+                 PC2=reducedDims(sl1)$PCA[, "PC2"],
+                 cell=colnames(sl1)) %>%
+  left_join(markerdat, by="cell")
+ggplot(foo, aes(pseudotime1, logcount, group=gene, color=gene)) +
+  geom_smooth(se=FALSE)
+ggsave(file.path("figures", "markers-together-smoothed.pdf"))
+ggplot(foo %>% filter(gene == "Dl"), aes(pseudotime1, logcount)) +
+  geom_smooth() +
+  ggtitle("Dl")
+ggsave(file.path("figures", "Dl-smoothed.pdf"))
+
+ggplot(foo, aes(PC1, PC2, color=pseudotime1)) +
+  geom_point()
+ggsave(file.path("figures", "PCA-pseudotime1-coloring.pdf"))
+ggplot(foo, aes(PC1, PC2, color=pseudotime2)) +
+  geom_point()
+ggsave(file.path("figures", "PCA-pseudotime2-coloring.pdf"))
+ggplot(foo, aes(PC1, PC2, color=pseudotime3)) +
+  geom_point()
+ggsave(file.path("figures", "PCA-pseudotime3-coloring.pdf"))
+```
+
+
+# Better selection of EB cells
+```{r add-eb-and-isc-markers}
+pcadat$ee = Matrix::colMeans(assays(sce)$logcounts[ee$gene[ee$gene %in% rownames(assays(sce)$logcounts)],])
+pcadat$isc = Matrix::colMeans(assays(sce)$logcounts[isc$gene[isc$gene %in% rownames(assays(sce)$logcounts)],])
+pcadat$eb = Matrix::colMeans(assays(sce)$logcounts[eb$gene[eb$gene %in% rownames(assays(sce)$logcounts)],])
+ggplot(pcadat, aes(isc)) + geom_histogram()
+ggplot(pcadat, aes(eb)) + geom_histogram()
+is_isc = pcadat$isc > 0.25 & pcadat$eb < 0.5 & pcadat$simple_celltype == "ISC/EB"
+is_eb = pcadat$isc < 0.25 & pcadat$eb > 0.5 & pcadat$simple_celltype == "ISC/EB" 
+pcadat$isc_clean = is_isc
+pcadat$eb_clean = is_eb
+pcadat$isc_eb_classify = ifelse(is_isc, "isc", ifelse(is_eb, "eb", "other"))
+ggplot(pcadat, aes(PC1, PC2, color=isc_eb_classify)) +
+  geom_point() 
+```
+
